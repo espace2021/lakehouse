@@ -1,0 +1,4 @@
+dags/*
+dbt/*
+jobs/*
+!*/.gitkeep

@@ -1,0 +1,213 @@
+# Plateforme lakehouse open source — TP (single node)
+# Les projets (DAG, dbt, jobs Spark) sont branchés via DAGS_DIR, DBT_DIR, JOBS_DIR dans .env
+# Démarrage : docker compose up -d --build
+# Profil optionnel : --profile ml (MLflow)
+name: lakehouse
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL_S3: http://seaweedfs:8333
+  AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+  AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+
+services:
+  # ---------------------------------------------------------------- Stockage
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest   # épingler une version en vrai
+    command: >
+      server -ip=seaweedfs -ip.bind=0.0.0.0 -dir=/data -volume.max=0 -master.volumeSizeLimitMB=1024
+      -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    ports: ["8333:8333", "9333:9333", "8888:8888"]
+    volumes:
+      - seaweed-data:/data
+      - ./conf/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/ >/dev/null 2>&1 || wget -S -qO- http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  init-buckets:
+    image: amazon/aws-cli:latest
+    environment: *s3-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for b in lakehouse mlflow; do
+          aws --endpoint-url http://seaweedfs:8333 s3 mb s3://$$b || true
+        done
+    depends_on:
+      seaweedfs: { condition: service_healthy }
+    restart: "no"
+
+  # ------------------------------------------------- Base de métadonnées (Airflow, MLflow, Nessie)
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    ports: ["5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./conf/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER}"]
+      interval: 5s
+      retries: 20
+
+  # ------------------------------------------------------- Catalogue Iceberg REST
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest   # épingler une version en vrai
+    ports: ["19120:19120"]
+    environment:
+      - nessie.version.store.type=JDBC2
+      - nessie.version.store.persist.jdbc.datasource=postgresql
+      - quarkus.datasource.postgresql.jdbc.url=jdbc:postgresql://postgres:5432/nessie
+      - quarkus.datasource.postgresql.username=${PG_USER}
+      - quarkus.datasource.postgresql.password=${PG_PASSWORD}
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://lakehouse/warehouse
+      - nessie.catalog.service.s3.default-options.endpoint=http://seaweedfs:8333/
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.request-signing-enabled=false
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:lake.s3
+      - lake.s3.name=${S3_ACCESS_KEY}
+      - lake.s3.secret=${S3_SECRET_KEY}
+      - nessie.server.authentication.enabled=false
+    depends_on:
+      postgres: { condition: service_healthy }
+      init-buckets: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------- Streaming
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes: [kafka-data:/var/lib/kafka/data]
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    ports: ["8081:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on: [kafka]
+
+  # ------------------------------------------------------------------- Calcul
+  spark-master:
+    image: spark:4.1.3-scala2.13-java17-python3-ubuntu
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports: ["8082:8080", "7077:7077"]
+    environment: *s3-env
+    volumes:
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ${JOBS_DIR:-./jobs}:/opt/jobs
+
+  spark-worker:
+    image: spark:4.1.3-scala2.13-java17-python3-ubuntu
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *s3-env
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 2g
+    volumes:
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ${JOBS_DIR:-./jobs}:/opt/jobs
+    depends_on: [spark-master]
+
+  spark-thrift:
+    build: ./docker/spark-thrift
+    hostname: spark-thrift
+    command: ["/opt/spark/sbin/start-thriftserver.sh",
+              "--master", "local[2]",
+              "--driver-memory", "2g"]
+    environment:
+      <<: *s3-env
+      SPARK_NO_DAEMONIZE: "true"
+    ports: ["10000:10000", "4041:4040"]
+    volumes:
+      - ./conf/spark/spark-thrift.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on: [nessie]
+
+  spark-connect:
+    image: spark:4.1.3-scala2.13-java17-python3-ubuntu
+    command: ["/opt/spark/sbin/start-connect-server.sh",
+              "--master", "local[*]",
+              "--driver-memory", "2g"]
+    environment:
+      <<: *s3-env
+      SPARK_NO_DAEMONIZE: "true"
+    ports: ["15002:15002", "4040:4040"]
+    volumes:
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ${JOBS_DIR:-./jobs}:/opt/jobs
+    depends_on: [spark-master]
+
+  # ---------------------------------------------------------------- Moteur SQL
+  trino:
+    image: trinodb/trino:476
+    ports: ["8085:8080"]
+    volumes:
+      - ./conf/trino/catalog:/etc/trino/catalog:ro
+    depends_on: [nessie]
+
+  # ------------------------------------------------------------- Orchestration
+  airflow:
+    build: ./docker/airflow
+    command: standalone
+    user: "${AIRFLOW_UID:-50000}:0"
+    ports: ["8080:8080"]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_USER}:${PG_PASSWORD}@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"   # TP uniquement : pas de login
+      AIRFLOW_CONN_TRINO_DEFAULT: trino://admin@trino:8080/iceberg
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+    volumes:
+      - ${DAGS_DIR:-./dags}:/opt/airflow/dags
+      - ${DBT_DIR:-./dbt}:/opt/airflow/dbt
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # ------------------------------------------------------------------------ ML
+  mlflow:
+    profiles: ["ml"]
+    build: ./docker/mlflow
+    ports: ["5000:5000"]
+    environment:
+      <<: *s3-env
+      MLFLOW_S3_ENDPOINT_URL: http://seaweedfs:8333
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/mlflow
+      --artifacts-destination s3://mlflow --serve-artifacts
+    depends_on:
+      postgres: { condition: service_healthy }
+      init-buckets: { condition: service_completed_successfully }
+
+volumes:
+  seaweed-data:
+  pg-data:
+  kafka-data:
+
+networks:
+  default:
+    name: lakehouse-net   # les projets branchés rejoignent ce réseau
